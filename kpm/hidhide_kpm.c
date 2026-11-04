@@ -349,8 +349,11 @@ static void parse_args(const char *args)
 	reset_config();
 
 	while (*p && idx < MAX_TARGETS) {
+
 		uint16_t vid = 0, pid = 0;
-		char name[64] = {0}, phys[64] = {0};
+		char name[64], phys[64];
+		name[0] = 0;
+		phys[0] = 0;
 
 		while (*p == ' ' || *p == '|' || *p == '\n') p++;
 		if (!*p) break;
