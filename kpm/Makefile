@@ -23,6 +23,8 @@ STRIP := $(TARGET_COMPILE)strip
 # -fno-PIC is mandatory (unsupported RELA relocation 311 otherwise)
 CFLAGS := -O2 -Wall -Wextra -fno-PIC -fno-asynchronous-unwind-tables -fno-stack-protector
 
+CFLAGS += -fno-tree-loop-distribute-patterns
+
 INCLUDE_DIRS  := . include patch/include linux/include linux/arch/arm64/include linux/tools/arch/arm64/include
 INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/kernel/$(dir))
 
