@@ -72,10 +72,12 @@ KPM_DESCRIPTION("input device compatibility layer");
 #define BUS_I2C_VAL     0x18
 
 /* ---- runtime config (set via load args / ctl0) ---- */
-static uint16_t target_vid = 0;         /* 0 = auto: use the built-in HID capability matcher */
-static uint16_t target_pid = 0;
-static char fake_name[64];              /* defaults XOR-filled at init */
-static char fake_phys[64];
+#define MAX_TARGETS 8
+static int target_count = 0;
+static uint16_t target_vid[MAX_TARGETS] = {0};
+static uint16_t target_pid[MAX_TARGETS] = {0};
+static char fake_name[MAX_TARGETS][64];
+static char fake_phys[MAX_TARGETS][64];
 static char *(*kernel_kstrdup)(const char *src, unsigned int flags);
 
 /* ---- XOR-obfuscated signature strings (key 0x5A) ---- */
@@ -144,22 +146,40 @@ static char *persistent_copy(const char *src)
 	return kernel_kstrdup(src, 0);
 }
 
-/* args format: "vid=0 pid=0 name=goodix_ts phys=i2c/1-005d" (vid=0 => auto) */
+/* args format: "vid=0x1234 pid=0x5678 name=my_mouse phys=i2c/1 | vid=0xabcd pid=0xefgh name=my_kb phys=i2c/2" */
 static void parse_args(const char *args)
 {
 	const char *p = args;
+	int idx = 0;
 	if (!p) return;
-	while (*p) {
-		while (*p == ' ') p++;
-		if (!*p) break;
-		if (!strncmp(p, "vid=", 4))       target_vid = (uint16_t)parse_num(p + 4);
-		else if (!strncmp(p, "pid=", 4))  target_pid = (uint16_t)parse_num(p + 4);
-		else if (!strncmp(p, "name=", 5)) copy_val(fake_name, sizeof(fake_name), p + 5);
-		else if (!strncmp(p, "phys=", 5)) copy_val(fake_phys, sizeof(fake_phys), p + 5);
-		while (*p && *p != ' ') p++;
-	}
-}
 
+	while (*p && idx < MAX_TARGETS) {
+		while (*p == ' ' || *p == '|') p++;
+		if (!*p) break;
+
+		uint16_t vid = 0, pid = 0;
+		char name[64] = {0}, phys[64] = {0};
+
+		while (*p && *p != '|') {
+			while (*p == ' ') p++;
+			if (!strncmp(p, "vid=", 4))       vid = (uint16_t)parse_num(p + 4);
+			else if (!strncmp(p, "pid=", 4))  pid = (uint16_t)parse_num(p + 4);
+			else if (!strncmp(p, "name=", 5)) copy_val(name, sizeof(name), p + 5);
+			else if (!strncmp(p, "phys=", 5)) copy_val(phys, sizeof(phys), p + 5);
+			while (*p && *p != ' ' && *p != '|') p++;
+		}
+
+		if (vid && pid) {
+			target_vid[idx] = vid;
+			target_pid[idx] = pid;
+			if (name[0]) strncpy(fake_name[idx], name, sizeof(fake_name[idx]) - 1);
+			if (phys[0]) strncpy(fake_phys[idx], phys, sizeof(fake_phys[idx]) - 1);
+			idx++;
+		}
+		if (*p == '|') p++;
+	}
+	target_count = idx;
+}
 /* capability test: is this dev a multi-touch digitizer? */
 static int is_mt_touch(uintptr_t dev)
 {
@@ -175,9 +195,10 @@ static int is_mt_touch(uintptr_t dev)
 static void before_input_register(hook_fargs1_t *fargs, void *udata)
 {
 	uintptr_t dev = (uintptr_t)fargs->args[0];
-	uint16_t bustype, vendor, product;
+	uint16_t vendor, product;
 	char fbuf[64];
 	char *name_copy, *phys_copy;
+	int i, matched = -1;
 
 	(void)udata;
 	if (!dev || (dev & 7) || is_bad_address((void *)dev) ||
@@ -187,33 +208,34 @@ static void before_input_register(hook_fargs1_t *fargs, void *udata)
 	vendor  = *(volatile uint16_t *)(dev + OFF_ID_VENDOR);
 	product = *(volatile uint16_t *)(dev + OFF_ID_PRODUCT);
 
-	/* explicit mode: only the configured device */
-	if (target_vid && (vendor != target_vid || product != target_pid))
-		return;
+	/* Check if this device matches ANY of our targets */
+	for (i = 0; i < target_count; i++) {
+		if (vendor == target_vid[i] && product == target_pid[i]) {
+			matched = i;
+			break;
+		}
+	}
+	if (matched == -1) return;
 
-	/* auto mode (and explicit sanity): must be a multi-touch digitizer */
-	if (!target_vid && !is_mt_touch(dev))
-		return;
+	/* Since we match explicitly, we don't need is_mt_touch check anymore */
+	if (fake_name[matched][0] == 0) return;
 
-	name_copy = persistent_copy(fake_name);
-	if (!name_copy)
-		return;
-	phys_copy = persistent_copy(fake_phys);
-	if (!phys_copy)
-		return;
+	name_copy = persistent_copy(fake_name[matched]);
+	if (!name_copy) return;
+	phys_copy = persistent_copy(fake_phys[matched]);
+	if (!phys_copy) return;
 
 	*(uint16_t *)(dev + OFF_ID_BUSTYPE) = BUS_I2C_VAL;
 	*(uint16_t *)(dev + OFF_ID_VENDOR)  = 0;
 	*(uint16_t *)(dev + OFF_ID_PRODUCT) = 0;
-	*(uint16_t *)(dev + OFF_ID_VERSION) = 0;  /* USB bcdDevice leaks origin; I2C panels are 0 */
+	*(uint16_t *)(dev + OFF_ID_VERSION) = 0;
 
-	/* name/phys/uniq are pointers: re-point, never write into them */
 	*(const char **)(dev + OFF_NAME) = name_copy;
 	*(const char **)(dev + OFF_PHYS) = phys_copy;
 	*(const char **)(dev + OFF_UNIQ) = 0;
 
 	xdec(fbuf, enc_hit, sizeof(enc_hit));
-	printk(fbuf, vendor, product, fake_name);
+	printk(fbuf, vendor, product, fake_name[matched]);
 }
 
 static void *input_register_device_addr = 0;
