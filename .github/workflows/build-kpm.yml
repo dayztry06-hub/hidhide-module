@@ -1,0 +1,44 @@
+name: Build KPM
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-kpm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install ARM bare-metal toolchain (13.3.rel1)
+        run: |
+          curl -fL -o arm-toolchain.tar.xz \
+            "https://developer.arm.com/-/media/Files/downloads/gnu/13.3.rel1/binrel/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-elf.tar.xz"
+          tar -xJf arm-toolchain.tar.xz
+          echo "TARGET_COMPILE=$PWD/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-elf/bin/aarch64-none-elf-" >> "$GITHUB_ENV"
+
+      - name: Fetch KernelPatch (pinned 0.13.5)
+        run: |
+          git clone https://github.com/bmax121/KernelPatch.git
+          cd KernelPatch
+          git checkout 0d6c60422cb6fb7778eba0597c2514444e9072a0
+
+      - name: Build hidhide.kpm
+        run: |
+          make -C kpm KP_DIR="$PWD/KernelPatch" TARGET_COMPILE="$TARGET_COMPILE"
+
+      - name: Verify artifact
+        run: |
+          file kpm/hidhide.kpm
+          sha256sum kpm/hidhide.kpm
+          ls -l kpm/hidhide.kpm
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hidhide-kpm
+          path: kpm/hidhide.kpm
+          if-no-files-found: error
