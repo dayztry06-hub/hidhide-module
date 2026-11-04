@@ -285,7 +285,7 @@ static void before_input_register(hook_fargs1_t *fargs, void *udata)
 	if (matched < 0)
 		return;
 
-	__sync_fetch_and_add(&hit_count[matched], 1);
+    hit_count[matched]++;
 
 	set_idx = matched % PRESET_SETS;
 	cls = classify(dev);
@@ -294,7 +294,7 @@ static void before_input_register(hook_fargs1_t *fargs, void *udata)
 		chosen_name = target_presets[set_idx][cls].name;
 		chosen_phys = target_presets[set_idx][cls].phys;
 	} else {
-		__sync_fetch_and_add(&drop_count, 1);
+		drop_count++;
 		switch (drop_mode) {
 		case DROP_SKIP:
 			fargs->skip_origin = 1;
