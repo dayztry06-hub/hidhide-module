@@ -184,10 +184,6 @@ static void before_input_register(hook_fargs1_t *fargs, void *udata)
 	    is_bad_address((void *)(dev + OFF_ABSBIT)))
 		return;
 
-	bustype = *(volatile uint16_t *)(dev + OFF_ID_BUSTYPE);
-	if (bustype != BUS_USB_VAL)
-		return;
-
 	vendor  = *(volatile uint16_t *)(dev + OFF_ID_VENDOR);
 	product = *(volatile uint16_t *)(dev + OFF_ID_PRODUCT);
 
