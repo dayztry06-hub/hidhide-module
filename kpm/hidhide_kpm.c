@@ -2,28 +2,30 @@
 /*
  * hidhide_kpm.c - KernelPatch Module (KPM) version of HIDHide.
  *
- * Hook input_register_device() and rewrite the identity of external HID
- * input devices. The current matcher targets USB multi-touch devices and
- * presents them as builtin I2C input devices.
- * As a KPM, symbols are resolved at load time via kallsyms: one binary,
- * no vermagic binding.
+ * Hook input_register_device() and rewrite the identity of every input_dev
+ * that a targeted external USB HID device registers. Each node is routed
+ * to a per-target preset by capability bitmap, so a composite device that
+ * surfaces 3-5 event nodes appears as 3-5 distinct plausible internal
+ * input devices instead of several clones of the same identity.
  *
- * v1.2: match by device capabilities, not by hard-coded VID/PID.
- *   auto mode (vid=0, default): any input_dev that is BUS_USB and has
- *     BTN_TOUCH + ABS_MT_SLOT is rewritten, regardless of its original
- *     USB identity.
- *   explicit mode (vid=0xXXXX pid=0xYYYY): only that device is touched.
+ * Intended loader:  KPM-Manager (Yervant7/KPM-Manager)
  *
- * Hardened build:
- *   - signature strings (hook target, log formats) are XOR-obfuscated so
- *     `strings` / casual static analysis reveals nothing
- *   - module description is deliberately innocuous
- *   - build with: strip --strip-unneeded (drops local symbol names while
- *     keeping relocations resolvable)
+ * KPM-Manager contract:
+ *   - Load path passes an EMPTY args string. Configure the module via the
+ *     per-module settings dialog (-> KPM_CTL0) instead.
+ *   - ctl0 outMsg is shown as a Toast. Keep it under ~2 lines.
  *
- * Load:   ksud kpm load hidhide.kpm "vid=0 pid=0 name=goodix_ts phys=i2c/1-005d"
- * Reconf: ksud kpm control hidhide "vid=... name=..."
- * Unload: ksud kpm unload hidhide
+ * Supported ctl0 commands (type into the settings dialog):
+ *   status                        show current targets, drop_mode, hit counters
+ *   clear                         remove all targets, reset counters, keep hook
+ *   vid=<v> pid=<p> | vid=... | ... [drop_mode=skip|mute|spoof]
+ *                                 full config, replaces previous targets
+ *
+ * Example:
+ *   vid=0x1038 pid=0x1892 | vid=0x28e9 pid=0x31ea drop_mode=skip
+ *
+ * Compile-time default (so reload after reboot needs no re-typing):
+ *   make ... HIDHIDE_DEFAULT_TARGETS='"vid=0x1038 pid=0x1892 | vid=0x28e9 pid=0x31ea"'
  */
 
 #include <compiler.h>
@@ -35,24 +37,17 @@
 #include <hook.h>
 
 KPM_NAME("hidhide");
-KPM_VERSION("1.3.0");
+KPM_VERSION("1.5.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("HIDHide contributors");
 KPM_DESCRIPTION("input device compatibility layer");
 
-/* ------------------------------------------------------------------ *
- * struct input_dev layout (arm64; the head of the struct, up to and
- * including absbit, has been stable for many kernel generations):
- *   +0    const char *name
- *   +8    const char *phys
- *   +16   const char *uniq
- *   +24   struct input_id id { u16 bustype; u16 vendor; u16 product; u16 version; }
- *   +32   unsigned long propbits[1]   (INPUT_PROP_CNT = 0x20)
- *   +40   unsigned long evbit[1]      (EV_CNT = 0x20)
- *   +48   unsigned long keybit[12]    (KEY_CNT = 0x300, 96 bytes)
- *   +144  unsigned long relbit[1]
- *   +152  unsigned long absbit[1]     (ABS_CNT = 0x40)
- * ------------------------------------------------------------------ */
+/* ---- compile-time default config (used when loaded with empty args) ---- */
+#ifndef HIDHIDE_DEFAULT_TARGETS
+#define HIDHIDE_DEFAULT_TARGETS ""
+#endif
+
+/* ---- struct input_dev layout (arm64) ---- */
 #define OFF_NAME        0
 #define OFF_PHYS        8
 #define OFF_UNIQ        16
@@ -60,37 +55,65 @@ KPM_DESCRIPTION("input device compatibility layer");
 #define OFF_ID_VENDOR   26
 #define OFF_ID_PRODUCT  28
 #define OFF_ID_VERSION  30
-#define OFF_KEYBIT_W5   (48 + 5 * 8)    /* keybit word holding bit 330 */
+#define OFF_PROPBIT     32
+#define OFF_EVBIT       40
+#define OFF_KEYBIT      48
+#define OFF_RELBIT      144
 #define OFF_ABSBIT      152
 
-#define BTN_TOUCH_BIT   0x14a           /* 330: word 5, bit 10 */
-#define BTN_TOUCH_MASK  (1ULL << (BTN_TOUCH_BIT % 64))
-#define ABS_MT_SLOT_BIT 0x2f            /* 47 */
-#define ABS_MT_SLOT_MASK (1ULL << ABS_MT_SLOT_BIT)
+#define EV_CNT          0x20
+#define KEY_CNT         0x300
+#define REL_CNT         0x10
+#define ABS_CNT         0x40
+
+#define EV_KEY          0x01
+#define EV_REL          0x02
+#define EV_ABS          0x03
+
+#define KEY_ESC         1
+#define KEY_VOLUMEUP    115
+#define BTN_LEFT        0x110
+#define BTN_TOUCH       0x14a
+#define ABS_MT_SLOT     0x2f
 
 #define BUS_USB_VAL     0x03
 #define BUS_I2C_VAL     0x18
 
-/* ---- runtime config (set via load args / ctl0) ---- */
+/* ---- multi-target config ---- */
 #define MAX_TARGETS 8
-static int target_count = 0;
-static uint16_t target_vid[MAX_TARGETS] = {0};
-static uint16_t target_pid[MAX_TARGETS] = {0};
-static char fake_name[MAX_TARGETS][64];
-static char fake_phys[MAX_TARGETS][64];
+static int      target_count = 0;
+static uint16_t target_vid[MAX_TARGETS];
+static uint16_t target_pid[MAX_TARGETS];
+static char     fake_name[MAX_TARGETS][64];
+static char     fake_phys[MAX_TARGETS][64];
+static uint32_t hit_count[MAX_TARGETS];   /* per-target hook fires that matched */
+static uint32_t drop_count;               /* total junk nodes dropped */
+
+#define DROP_SKIP   0
+#define DROP_MUTE   1
+#define DROP_SPOOF  2
+static int drop_mode = DROP_SKIP;
+
+static const char *drop_mode_name(int m)
+{
+	switch (m) {
+	case DROP_SKIP:  return "skip";
+	case DROP_MUTE:  return "mute";
+	case DROP_SPOOF: return "spoof";
+	default:         return "?";
+	}
+}
+
 static char *(*kernel_kstrdup)(const char *src, unsigned int flags);
 
 /* ---- XOR-obfuscated signature strings (key 0x5A) ---- */
 #define XK 0x5A
 static const unsigned char enc_sym[] = { 0x33, 0x34, 0x2a, 0x2f, 0x2e, 0x05, 0x28, 0x3f, 0x3d, 0x33, 0x29, 0x2e, 0x3f, 0x28, 0x05, 0x3e, 0x3f, 0x2c, 0x33, 0x39, 0x3f };
 static const unsigned char enc_hit[] = { 0x01, 0x32, 0x32, 0x07, 0x7a, 0x2a, 0x3b, 0x2e, 0x39, 0x32, 0x3f, 0x3e, 0x7a, 0x7f, 0x6a, 0x6e, 0x22, 0x60, 0x7f, 0x6a, 0x6e, 0x22, 0x7a, 0x77, 0x64, 0x7a, 0x7f, 0x29, 0x50 };
-static const unsigned char enc_init[] = { 0x01, 0x32, 0x32, 0x07, 0x7a, 0x35, 0x34, 0x7a, 0x7f, 0x29, 0x7a, 0x2c, 0x33, 0x3e, 0x67, 0x7f, 0x6a, 0x6e, 0x22, 0x7a, 0x2a, 0x33, 0x3e, 0x67, 0x7f, 0x6a, 0x6e, 0x22, 0x7a, 0x34, 0x3b, 0x37, 0x3f, 0x67, 0x7f, 0x29, 0x7a, 0x2a, 0x32, 0x23, 0x29, 0x67, 0x7f, 0x29, 0x50 };
-static const unsigned char enc_ctl[] = { 0x01, 0x32, 0x32, 0x07, 0x7a, 0x39, 0x3c, 0x3d, 0x7a, 0x2c, 0x33, 0x3e, 0x67, 0x7f, 0x6a, 0x6e, 0x22, 0x7a, 0x2a, 0x33, 0x3e, 0x67, 0x7f, 0x6a, 0x6e, 0x22, 0x7a, 0x34, 0x3b, 0x37, 0x3f, 0x67, 0x7f, 0x29, 0x7a, 0x2a, 0x32, 0x23, 0x29, 0x67, 0x7f, 0x29, 0x50 };
+static const unsigned char enc_init[] = { 0x01, 0x32, 0x32, 0x07, 0x7a, 0x35, 0x34, 0x7a, 0x7f, 0x29, 0x7a, 0x2c, 0x3b, 0x2a, 0x3d, 0x3f, 0x2e, 0x29, 0x67, 0x7f, 0x3e, 0x50 };
 static const unsigned char enc_nosym[] = { 0x01, 0x32, 0x32, 0x07, 0x7a, 0x29, 0x23, 0x37, 0x7a, 0x34, 0x35, 0x2e, 0x7a, 0x3c, 0x35, 0x2f, 0x34, 0x3e, 0x50 };
 static const unsigned char enc_herr[] = { 0x01, 0x32, 0x32, 0x07, 0x7a, 0x32, 0x35, 0x35, 0x31, 0x7a, 0x3f, 0x28, 0x28, 0x7a, 0x7f, 0x3e, 0x50 };
 static const unsigned char enc_exit[] = { 0x01, 0x32, 0x32, 0x07, 0x7a, 0x35, 0x3c, 0x3c, 0x50 };
-static const unsigned char enc_fname[] = { 0x3d, 0x35, 0x35, 0x3e, 0x33, 0x22, 0x05, 0x2e, 0x29 };
-static const unsigned char enc_fphys[] = { 0x33, 0x68, 0x39, 0x75, 0x6b, 0x77, 0x6a, 0x6a, 0x6f, 0x3e };
 static const unsigned char enc_dup[] = { 0x31, 0x29, 0x2e, 0x28, 0x3e, 0x2f, 0x2a };
 
 static void xdec(char *dst, const unsigned char *src, int len)
@@ -105,10 +128,7 @@ static unsigned long parse_num(const char *s)
 {
 	unsigned long v = 0;
 	int base = 10;
-	if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
-		base = 16;
-		s += 2;
-	}
+	if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) { base = 16; s += 2; }
 	while (*s) {
 		char c = *s;
 		int d;
@@ -126,119 +146,302 @@ static unsigned long parse_num(const char *s)
 static void copy_val(char *dst, int dstlen, const char *s)
 {
 	int i = 0;
-	while (*s && *s != ' ' && *s != '\n' && i < dstlen - 1)
+	while (*s && *s != ' ' && *s != '\n' && *s != '|' && i < dstlen - 1)
 		dst[i++] = *s++;
 	dst[i] = 0;
 }
 
-/*
- * input_dev keeps these pointers after registration. KPM executable/data
- * memory is released when the module is unloaded, so pointing at the module's
- * static buffers would leave dangling pointers. Allocate immutable copies
- * outside KPM module storage instead. They deliberately live until reboot;
- * registrations are rare and each pair is at most 128 bytes.
- */
 static char *persistent_copy(const char *src)
 {
-	if (!kernel_kstrdup)
-		return 0;
-	/* flags=0 requests a non-reclaiming allocation suitable for this hook. */
+	if (!kernel_kstrdup) return 0;
 	return kernel_kstrdup(src, 0);
 }
 
-/* args format: "vid=0x1234 pid=0x5678 name=my_mouse phys=i2c/1 | vid=0xabcd pid=0xefgh name=my_kb phys=i2c/2" */
-static void parse_args(const char *args)
+static int test_input_bit(uintptr_t dev, unsigned off, unsigned long bit_cnt, unsigned bit)
 {
-	const char *p = args;
-	int idx = 0;
-	if (!p) return;
+	unsigned word, shift;
+	uintptr_t addr;
+	if (bit >= bit_cnt) return 0;
+	word  = bit >> 6;
+	shift = bit & 63;
+	addr  = dev + off + (word << 3);
+	if (is_bad_address((void *)addr)) return 0;
+	return (int)((*(volatile uint64_t *)addr >> shift) & 1ULL);
+}
 
-	while (*p && idx < MAX_TARGETS) {
-		while (*p == ' ' || *p == '|') p++;
-		if (!*p) break;
+static int has_evbit (uintptr_t dev, unsigned e) { return test_input_bit(dev, OFF_EVBIT,  EV_CNT,  e); }
+static int has_keybit(uintptr_t dev, unsigned k) { return test_input_bit(dev, OFF_KEYBIT, KEY_CNT, k); }
+static int has_absbit(uintptr_t dev, unsigned a) { return test_input_bit(dev, OFF_ABSBIT, ABS_CNT, a); }
 
-		uint16_t vid = 0, pid = 0;
-		char name[64] = {0}, phys[64] = {0};
+enum cap_class {
+	CLS_TOUCH = 0,
+	CLS_KBD,
+	CLS_MOUSE,
+	CLS_MEDIA,
+	CLS_BTN,
+	NUM_CLASSES,
+	CLS_JUNK = -1,
+};
 
-		while (*p && *p != '|') {
-			while (*p == ' ') p++;
-			if (!strncmp(p, "vid=", 4))       vid = (uint16_t)parse_num(p + 4);
-			else if (!strncmp(p, "pid=", 4))  pid = (uint16_t)parse_num(p + 4);
-			else if (!strncmp(p, "name=", 5)) copy_val(name, sizeof(name), p + 5);
-			else if (!strncmp(p, "phys=", 5)) copy_val(phys, sizeof(phys), p + 5);
-			while (*p && *p != ' ' && *p != '|') p++;
-		}
+struct preset { const char *name; const char *phys; };
 
-		if (vid && pid) {
-			target_vid[idx] = vid;
-			target_pid[idx] = pid;
-			if (name[0]) strncpy(fake_name[idx], name, sizeof(fake_name[idx]) - 1);
-			if (phys[0]) strncpy(fake_phys[idx], phys, sizeof(fake_phys[idx]) - 1);
-			idx++;
-		}
-		if (*p == '|') p++;
+/* Pineapple-baseline plausible internal names; no collisions with observed:
+ *   gpio-keys, aw-haptic-hv, pmic_pwrkey, pmic_resin, NVTCapacitive*,
+ *   double-headset-input, pineapple-qrd-snd-card*
+ */
+#define PRESET_SETS 2
+static const struct preset target_presets[PRESET_SETS][NUM_CLASSES] = {
+	{	/* set 0 (target[0], typically a mouse) */
+		[CLS_TOUCH] = { "goodix_ts",        "i2c/0-005d" },
+		[CLS_KBD]   = { "hall_ic",          "platform/hall_ic/input0" },
+		[CLS_MOUSE] = { "fp_nav_input",     "qbt_handler/fp_nav" },
+		[CLS_MEDIA] = { "kpdpwr_on",        "platform/kpdpwr_on/input0" },
+		[CLS_BTN]   = { "tri-state-key",    "platform/tri-state-key/input0" },
+	},
+	{	/* set 1 (target[1], typically a keyboard) */
+		[CLS_TOUCH] = { "focaltech_touch",  "i2c/0-0038" },
+		[CLS_KBD]   = { "qpnp_pon",         "platform/qpnp_pon/input0" },
+		[CLS_MOUSE] = { "goodix_fp_nav",    "platform/goodix_fp/nav" },
+		[CLS_MEDIA] = { "pm8008_gpio_keys", "platform/pm8008_gpio_keys/input0" },
+		[CLS_BTN]   = { "sar_sensor",       "platform/sar_sensor/input0" },
+	},
+};
+
+static enum cap_class classify(uintptr_t dev)
+{
+	int ev_key = has_evbit(dev, EV_KEY);
+	int ev_rel = has_evbit(dev, EV_REL);
+	int ev_abs = has_evbit(dev, EV_ABS);
+
+	if (ev_abs && has_keybit(dev, BTN_TOUCH) && has_absbit(dev, ABS_MT_SLOT))
+		return CLS_TOUCH;
+	if (ev_key && has_keybit(dev, KEY_ESC) && !ev_rel && !ev_abs)
+		return CLS_KBD;
+	if (ev_rel)
+		return CLS_MOUSE;
+	if (ev_key && has_keybit(dev, KEY_VOLUMEUP))
+		return CLS_MEDIA;
+	if (ev_key && has_keybit(dev, BTN_LEFT))
+		return CLS_BTN;
+	return CLS_JUNK;
+}
+
+static void nuke_caps(uintptr_t dev)
+{
+	unsigned i;
+	if (!is_bad_address((void *)(dev + OFF_EVBIT)))
+		*(volatile uint64_t *)(dev + OFF_EVBIT) = 0;
+	if (!is_bad_address((void *)(dev + OFF_RELBIT)))
+		*(volatile uint64_t *)(dev + OFF_RELBIT) = 0;
+	if (!is_bad_address((void *)(dev + OFF_ABSBIT)))
+		*(volatile uint64_t *)(dev + OFF_ABSBIT) = 0;
+	for (i = 0; i < 12; i++) {
+		uintptr_t a = dev + OFF_KEYBIT + (i << 3);
+		if (is_bad_address((void *)a))
+			break;
+		*(volatile uint64_t *)a = 0;
 	}
-	target_count = idx;
-}
-/* capability test: is this dev a multi-touch digitizer? */
-static int is_mt_touch(uintptr_t dev)
-{
-	if (is_bad_address((void *)dev) ||
-	    is_bad_address((void *)(dev + OFF_ABSBIT)))
-		return 0;
-	uint64_t keyw5 = *(volatile uint64_t *)(dev + OFF_KEYBIT_W5);
-	uint64_t absb  = *(volatile uint64_t *)(dev + OFF_ABSBIT);
-	return (keyw5 & BTN_TOUCH_MASK) && (absb & ABS_MT_SLOT_MASK);
 }
 
-/* before-callback of hook_wrap1 on input_register_device(dev) */
+static void rewrite_identity(uintptr_t dev, const char *name_copy, const char *phys_copy)
+{
+	*(uint16_t *)(dev + OFF_ID_BUSTYPE) = BUS_I2C_VAL;
+	*(uint16_t *)(dev + OFF_ID_VENDOR)  = 0;
+	*(uint16_t *)(dev + OFF_ID_PRODUCT) = 0;
+	*(uint16_t *)(dev + OFF_ID_VERSION) = 0;
+	*(const char **)(dev + OFF_NAME) = name_copy;
+	*(const char **)(dev + OFF_PHYS) = phys_copy;
+	*(const char **)(dev + OFF_UNIQ) = 0;
+}
+
 static void before_input_register(hook_fargs1_t *fargs, void *udata)
 {
 	uintptr_t dev = (uintptr_t)fargs->args[0];
-	uint16_t vendor, product;
-	char fbuf[64];
+	uint16_t bustype, vendor, product;
+	enum cap_class cls;
+	const char *chosen_name, *chosen_phys;
 	char *name_copy, *phys_copy;
-	int i, matched = -1;
+	char fbuf[64];
+	int i, matched = -1, set_idx;
 
 	(void)udata;
 	if (!dev || (dev & 7) || is_bad_address((void *)dev) ||
 	    is_bad_address((void *)(dev + OFF_ABSBIT)))
 		return;
 
+	bustype = *(volatile uint16_t *)(dev + OFF_ID_BUSTYPE);
+	if (bustype != BUS_USB_VAL)
+		return;
+
 	vendor  = *(volatile uint16_t *)(dev + OFF_ID_VENDOR);
 	product = *(volatile uint16_t *)(dev + OFF_ID_PRODUCT);
 
-	/* Check if this device matches ANY of our targets */
 	for (i = 0; i < target_count; i++) {
 		if (vendor == target_vid[i] && product == target_pid[i]) {
 			matched = i;
 			break;
 		}
 	}
-	if (matched == -1) return;
+	if (matched < 0)
+		return;
 
-	/* Since we match explicitly, we don't need is_mt_touch check anymore */
-	if (fake_name[matched][0] == 0) return;
+	__sync_fetch_and_add(&hit_count[matched], 1);
 
-	name_copy = persistent_copy(fake_name[matched]);
+	set_idx = matched % PRESET_SETS;
+	cls = classify(dev);
+
+	if (cls != CLS_JUNK) {
+		chosen_name = target_presets[set_idx][cls].name;
+		chosen_phys = target_presets[set_idx][cls].phys;
+	} else {
+		__sync_fetch_and_add(&drop_count, 1);
+		switch (drop_mode) {
+		case DROP_SKIP:
+			fargs->skip_origin = 1;
+			fargs->ret = 0;
+			return;
+		case DROP_MUTE:
+			nuke_caps(dev);
+			chosen_name = fake_name[matched][0] ? fake_name[matched] : "sar_sensor";
+			chosen_phys = fake_phys[matched][0] ? fake_phys[matched] : "platform/sar_sensor/input1";
+			break;
+		case DROP_SPOOF:
+		default:
+			chosen_name = fake_name[matched][0] ? fake_name[matched] : "hall_ic";
+			chosen_phys = fake_phys[matched][0] ? fake_phys[matched] : "platform/hall_ic/input1";
+			break;
+		}
+	}
+
+	name_copy = persistent_copy(chosen_name);
 	if (!name_copy) return;
-	phys_copy = persistent_copy(fake_phys[matched]);
+	phys_copy = persistent_copy(chosen_phys);
 	if (!phys_copy) return;
 
-	*(uint16_t *)(dev + OFF_ID_BUSTYPE) = BUS_I2C_VAL;
-	*(uint16_t *)(dev + OFF_ID_VENDOR)  = 0;
-	*(uint16_t *)(dev + OFF_ID_PRODUCT) = 0;
-	*(uint16_t *)(dev + OFF_ID_VERSION) = 0;
-
-	*(const char **)(dev + OFF_NAME) = name_copy;
-	*(const char **)(dev + OFF_PHYS) = phys_copy;
-	*(const char **)(dev + OFF_UNIQ) = 0;
+	rewrite_identity(dev, name_copy, phys_copy);
 
 	xdec(fbuf, enc_hit, sizeof(enc_hit));
-	printk(fbuf, vendor, product, fake_name[matched]);
+	printk(fbuf, vendor, product, chosen_name);
 }
 
 static void *input_register_device_addr = 0;
+
+static void reset_config(void)
+{
+	int i;
+	target_count = 0;
+	for (i = 0; i < MAX_TARGETS; i++) {
+		target_vid[i] = 0;
+		target_pid[i] = 0;
+		fake_name[i][0] = 0;
+		fake_phys[i][0] = 0;
+		hit_count[i] = 0;
+	}
+	drop_count = 0;
+}
+
+static void parse_args(const char *args)
+{
+	const char *p = args;
+	int idx = 0;
+	if (!p) return;
+
+	reset_config();
+
+	while (*p && idx < MAX_TARGETS) {
+		uint16_t vid = 0, pid = 0;
+		char name[64] = {0}, phys[64] = {0};
+
+		while (*p == ' ' || *p == '|' || *p == '\n') p++;
+		if (!*p) break;
+
+		while (*p && *p != '|') {
+			while (*p == ' ') p++;
+			if (!*p || *p == '|') break;
+			if      (!strncmp(p, "vid=", 4))  vid = (uint16_t)parse_num(p + 4);
+			else if (!strncmp(p, "pid=", 4))  pid = (uint16_t)parse_num(p + 4);
+			else if (!strncmp(p, "name=", 5)) copy_val(name, sizeof(name), p + 5);
+			else if (!strncmp(p, "phys=", 5)) copy_val(phys, sizeof(phys), p + 5);
+			else if (!strncmp(p, "drop_mode=", 10)) {
+				const char *v = p + 10;
+				if      (!strncmp(v, "skip", 4))  drop_mode = DROP_SKIP;
+				else if (!strncmp(v, "mute", 4))  drop_mode = DROP_MUTE;
+				else if (!strncmp(v, "spoof", 5)) drop_mode = DROP_SPOOF;
+			}
+			while (*p && *p != ' ' && *p != '|') p++;
+		}
+
+		if (vid && pid) {
+			int j;
+			target_vid[idx] = vid;
+			target_pid[idx] = pid;
+			for (j = 0; j < 63 && name[j]; j++) fake_name[idx][j] = name[j];
+			fake_name[idx][j] = 0;
+			for (j = 0; j < 63 && phys[j]; j++) fake_phys[idx][j] = phys[j];
+			fake_phys[idx][j] = 0;
+			idx++;
+		}
+
+		if (*p == '|') p++;
+	}
+	target_count = idx;
+}
+
+/* ---- outMsg builders: Toast-friendly, bounded ---- */
+static int append_s(char *buf, int cap, int pos, const char *s)
+{
+	while (*s && pos < cap - 1) buf[pos++] = *s++;
+	buf[pos] = 0;
+	return pos;
+}
+
+static int append_hex(char *buf, int cap, int pos, uint32_t v, int width)
+{
+	static const char hex[] = "0123456789abcdef";
+	char tmp[9];
+	int n = 0, i;
+	if (v == 0 && width == 0) tmp[n++] = '0';
+	while (v) { tmp[n++] = hex[v & 0xf]; v >>= 4; }
+	while (n < width) tmp[n++] = '0';
+	for (i = n - 1; i >= 0 && pos < cap - 1; i--) buf[pos++] = tmp[i];
+	buf[pos] = 0;
+	return pos;
+}
+
+static int append_dec(char *buf, int cap, int pos, uint32_t v)
+{
+	char tmp[11];
+	int n = 0, i;
+	if (v == 0) tmp[n++] = '0';
+	while (v) { tmp[n++] = '0' + (v % 10); v /= 10; }
+	for (i = n - 1; i >= 0 && pos < cap - 1; i--) buf[pos++] = tmp[i];
+	buf[pos] = 0;
+	return pos;
+}
+
+static int build_summary(char *buf, int cap)
+{
+	int pos = 0, i;
+	pos = append_s(buf, cap, pos, "targets=");
+	pos = append_dec(buf, cap, pos, target_count);
+	pos = append_s(buf, cap, pos, " mode=");
+	pos = append_s(buf, cap, pos, drop_mode_name(drop_mode));
+	pos = append_s(buf, cap, pos, " drops=");
+	pos = append_dec(buf, cap, pos, drop_count);
+	pos = append_s(buf, cap, pos, "\n");
+	for (i = 0; i < target_count && pos < cap - 24; i++) {
+		pos = append_s(buf, cap, pos, "[");
+		pos = append_dec(buf, cap, pos, i);
+		pos = append_s(buf, cap, pos, "] ");
+		pos = append_hex(buf, cap, pos, target_vid[i], 4);
+		pos = append_s(buf, cap, pos, ":");
+		pos = append_hex(buf, cap, pos, target_pid[i], 4);
+		pos = append_s(buf, cap, pos, " hits=");
+		pos = append_dec(buf, cap, pos, hit_count[i]);
+		pos = append_s(buf, cap, pos, "\n");
+	}
+	return pos;
+}
 
 static long hidhide_init(const char *args, const char *event, void *__user reserved)
 {
@@ -248,13 +451,14 @@ static long hidhide_init(const char *args, const char *event, void *__user reser
 	char fbuf[64];
 
 	(void)reserved;
-	/* fill obfuscated defaults before args may override them */
-	if (!fake_name[0])
-		xdec(fake_name, enc_fname, sizeof(enc_fname));
-	if (!fake_phys[0])
-		xdec(fake_phys, enc_fphys, sizeof(enc_fphys));
+	reset_config();
 
-	parse_args(args);
+	/* KPM-Manager loads with empty args; fall through to compile-time default. */
+	if (args && args[0])
+		parse_args(args);
+	else
+		parse_args(HIDHIDE_DEFAULT_TARGETS);
+
 	xdec(dup_sym, enc_dup, sizeof(enc_dup));
 	kernel_kstrdup = (void *)kallsyms_lookup_name(dup_sym);
 	if (!kernel_kstrdup) {
@@ -272,6 +476,65 @@ static long hidhide_init(const char *args, const char *event, void *__user reser
 	}
 
 	err = hook_wrap1(input_register_device_addr, before_input_register, 0, 0);
+	if (err != HOOK_NO_ERR) {
+		xdec(fbuf, enc_herr, sizeof(enc_herr));
+		printk(fbuf, err);
+		return err;
+	}
+
+	xdec(fbuf, enc_init, sizeof(enc_init));
+	printk(fbuf, event, target_count);
+	return 0;
+}
+
+static long hidhide_ctl0(const char *args, char *__user out_msg, int outlen)
+{
+	char buf[384];
+	int n = 0;
+	const char *p = args ? args : "";
+
+	while (*p == ' ') p++;
+
+	if (!strncmp(p, "status", 6) || p[0] == '?' || p[0] == 0) {
+		n = build_summary(buf, sizeof(buf));
+	} else if (!strncmp(p, "clear", 5)) {
+		reset_config();
+		n = append_s(buf, sizeof(buf), 0, "cleared\n");
+		n = append_s(buf, sizeof(buf), n, "targets=0 mode=");
+		n = append_s(buf, sizeof(buf), n, drop_mode_name(drop_mode));
+		n = append_s(buf, sizeof(buf), n, "\n");
+	} else {
+		parse_args(p);
+		n = append_s(buf, sizeof(buf), 0, "applied targets=");
+		n = append_dec(buf, sizeof(buf), n, target_count);
+		n = append_s(buf, sizeof(buf), n, " mode=");
+		n = append_s(buf, sizeof(buf), n, drop_mode_name(drop_mode));
+		n = append_s(buf, sizeof(buf), n, "\n");
+	}
+
+	if (out_msg && outlen > 0) {
+		int copy = n < outlen - 1 ? n : outlen - 1;
+		buf[copy] = 0;
+		compat_copy_to_user(out_msg, buf, copy + 1);
+	}
+	return 0;
+}
+
+static long hidhide_exit(void *__user reserved)
+{
+	char fbuf[16];
+
+	(void)reserved;
+	if (input_register_device_addr)
+		hook_unwrap(input_register_device_addr, before_input_register, 0);
+	xdec(fbuf, enc_exit, sizeof(enc_exit));
+	printk(fbuf);
+	return 0;
+}
+
+KPM_INIT(hidhide_init);
+KPM_CTL0(hidhide_ctl0);
+KPM_EXIT(hidhide_exit);r, 0, 0);
 	if (err != HOOK_NO_ERR) {
 		xdec(fbuf, enc_herr, sizeof(enc_herr));
 		printk(fbuf, err);
