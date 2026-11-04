@@ -28,7 +28,19 @@
  * only strncmp (the sole string op we actually call); gcc inlines
  * constant-length strncmp calls, so no external symbol reference is emitted.
  */
-extern int strncmp(const char *s1, const char *s2, unsigned long n);
+__attribute__((used))
+int strncmp(const char *s1, const char *s2, unsigned long n)
+{
+	const volatile unsigned char *a = (const volatile unsigned char *)s1;
+	const volatile unsigned char *b = (const volatile unsigned char *)s2;
+	unsigned long i;
+	for (i = 0; i < n; i++) {
+		unsigned char ca = a[i], cb = b[i];
+		if (ca != cb) return (int)ca - (int)cb;
+		if (!ca) return 0;
+	}
+	return 0;
+}
 
 /*
  * KernelPatch's module loader resolves undefined symbols only against its
