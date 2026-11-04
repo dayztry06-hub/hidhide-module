@@ -2,30 +2,17 @@
 /*
  * hidhide_kpm.c - KernelPatch Module (KPM) version of HIDHide.
  *
- * Hook input_register_device() and rewrite the identity of every input_dev
- * that a targeted external USB HID device registers. Each node is routed
- * to a per-target preset by capability bitmap, so a composite device that
- * surfaces 3-5 event nodes appears as 3-5 distinct plausible internal
- * input devices instead of several clones of the same identity.
+ * Intended loader: KPM-Manager (Yervant7/KPM-Manager).
+ * KPM-Manager loads with empty args; configure via ctl0 (settings dialog).
  *
- * Intended loader:  KPM-Manager (Yervant7/KPM-Manager)
+ * ctl0 commands:
+ *   status                       show targets, drop_mode, hit counters
+ *   clear                        remove targets, reset counters
+ *   vid=<v> pid=<p> | vid=... [drop_mode=skip|mute|spoof]
+ *                                full config, replaces previous
  *
- * KPM-Manager contract:
- *   - Load path passes an EMPTY args string. Configure the module via the
- *     per-module settings dialog (-> KPM_CTL0) instead.
- *   - ctl0 outMsg is shown as a Toast. Keep it under ~2 lines.
- *
- * Supported ctl0 commands (type into the settings dialog):
- *   status                        show current targets, drop_mode, hit counters
- *   clear                         remove all targets, reset counters, keep hook
- *   vid=<v> pid=<p> | vid=... | ... [drop_mode=skip|mute|spoof]
- *                                 full config, replaces previous targets
- *
- * Example:
- *   vid=0x1038 pid=0x1892 | vid=0x28e9 pid=0x31ea drop_mode=skip
- *
- * Compile-time default (so reload after reboot needs no re-typing):
- *   make ... HIDHIDE_DEFAULT_TARGETS='"vid=0x1038 pid=0x1892 | vid=0x28e9 pid=0x31ea"'
+ * Compile-time default (so empty-args load auto-applies your rig):
+ *   make ... HIDHIDE_DEFAULT_TARGETS='vid=0x1038 pid=0x1892 | vid=0x28e9 pid=0x31ea'
  */
 
 #include <compiler.h>
@@ -33,8 +20,61 @@
 #include <linux/printk.h>
 #include <common.h>
 #include <kputils.h>
-#include <linux/string.h>
 #include <hook.h>
+
+/*
+ * Deliberately skipping <linux/string.h>: it provides a static inline
+ * memset that would collide with the local override below. We declare
+ * only strncmp (the sole string op we actually call); gcc inlines
+ * constant-length strncmp calls, so no external symbol reference is emitted.
+ */
+extern int strncmp(const char *s1, const char *s2, unsigned long n);
+
+/*
+ * KernelPatch's module loader resolves undefined symbols only against its
+ * own export table (symbol_lookup_name), not against kernel kallsyms.
+ * Kernel libc is exported as kfuncmemset / kfuncmemcpy, NOT bare "memset".
+ * When gcc emits an implicit mem* call (char x[64] = {0}; loop-idiom
+ * recognition; small struct copies) the loader rejects with
+ *   "unknown symbol: memset"
+ *
+ * Fix: provide local implementations. All implicit emissions bind here at
+ * link time, no external lookup needed.
+ *
+ * __attribute__((used)) prevents DCE if gcc sees no explicit callers.
+ * volatile accesses suppress loop-idiom recognition from turning the body
+ * into a recursive memset/memcpy call.
+ */
+__attribute__((used))
+void *memset(void *dst, int c, unsigned long n)
+{
+	volatile unsigned char *d = (volatile unsigned char *)dst;
+	unsigned long i;
+	for (i = 0; i < n; i++) d[i] = (unsigned char)c;
+	return dst;
+}
+
+__attribute__((used))
+void *memcpy(void *dst, const void *src, unsigned long n)
+{
+	volatile unsigned char *d = (volatile unsigned char *)dst;
+	const volatile unsigned char *s = (const volatile unsigned char *)src;
+	unsigned long i;
+	for (i = 0; i < n; i++) d[i] = s[i];
+	return dst;
+}
+
+__attribute__((used))
+void *memmove(void *dst, const void *src, unsigned long n)
+{
+	volatile unsigned char *d = (volatile unsigned char *)dst;
+	const volatile unsigned char *s = (const volatile unsigned char *)src;
+	unsigned long i;
+	if (d == s || n == 0) return dst;
+	if (d < s) for (i = 0; i < n; i++) d[i] = s[i];
+	else       for (i = n; i > 0; i--) d[i - 1] = s[i - 1];
+	return dst;
+}
 
 KPM_NAME("hidhide");
 KPM_VERSION("1.5.0");
@@ -42,7 +82,6 @@ KPM_LICENSE("GPL v2");
 KPM_AUTHOR("HIDHide contributors");
 KPM_DESCRIPTION("input device compatibility layer");
 
-/* ---- compile-time default config (used when loaded with empty args) ---- */
 #ifndef HIDHIDE_DEFAULT_TARGETS
 #define HIDHIDE_DEFAULT_TARGETS ""
 #endif
@@ -79,15 +118,14 @@ KPM_DESCRIPTION("input device compatibility layer");
 #define BUS_USB_VAL     0x03
 #define BUS_I2C_VAL     0x18
 
-/* ---- multi-target config ---- */
 #define MAX_TARGETS 8
 static int      target_count = 0;
 static uint16_t target_vid[MAX_TARGETS];
 static uint16_t target_pid[MAX_TARGETS];
 static char     fake_name[MAX_TARGETS][64];
 static char     fake_phys[MAX_TARGETS][64];
-static uint32_t hit_count[MAX_TARGETS];   /* per-target hook fires that matched */
-static uint32_t drop_count;               /* total junk nodes dropped */
+static uint32_t hit_count[MAX_TARGETS];
+static uint32_t drop_count;
 
 #define DROP_SKIP   0
 #define DROP_MUTE   1
@@ -106,7 +144,6 @@ static const char *drop_mode_name(int m)
 
 static char *(*kernel_kstrdup)(const char *src, unsigned int flags);
 
-/* ---- XOR-obfuscated signature strings (key 0x5A) ---- */
 #define XK 0x5A
 static const unsigned char enc_sym[] = { 0x33, 0x34, 0x2a, 0x2f, 0x2e, 0x05, 0x28, 0x3f, 0x3d, 0x33, 0x29, 0x2e, 0x3f, 0x28, 0x05, 0x3e, 0x3f, 0x2c, 0x33, 0x39, 0x3f };
 static const unsigned char enc_hit[] = { 0x01, 0x32, 0x32, 0x07, 0x7a, 0x2a, 0x3b, 0x2e, 0x39, 0x32, 0x3f, 0x3e, 0x7a, 0x7f, 0x6a, 0x6e, 0x22, 0x60, 0x7f, 0x6a, 0x6e, 0x22, 0x7a, 0x77, 0x64, 0x7a, 0x7f, 0x29, 0x50 };
@@ -119,8 +156,7 @@ static const unsigned char enc_dup[] = { 0x31, 0x29, 0x2e, 0x28, 0x3e, 0x2f, 0x2
 static void xdec(char *dst, const unsigned char *src, int len)
 {
 	int i;
-	for (i = 0; i < len; i++)
-		dst[i] = src[i] ^ XK;
+	for (i = 0; i < len; i++) dst[i] = src[i] ^ XK;
 	dst[i] = 0;
 }
 
@@ -185,10 +221,6 @@ enum cap_class {
 
 struct preset { const char *name; const char *phys; };
 
-/* Pineapple-baseline plausible internal names; no collisions with observed:
- *   gpio-keys, aw-haptic-hv, pmic_pwrkey, pmic_resin, NVTCapacitive*,
- *   double-headset-input, pineapple-qrd-snd-card*
- */
 #define PRESET_SETS 2
 static const struct preset target_presets[PRESET_SETS][NUM_CLASSES] = {
 	{	/* set 0 (target[0], typically a mouse) */
@@ -237,8 +269,7 @@ static void nuke_caps(uintptr_t dev)
 		*(volatile uint64_t *)(dev + OFF_ABSBIT) = 0;
 	for (i = 0; i < 12; i++) {
 		uintptr_t a = dev + OFF_KEYBIT + (i << 3);
-		if (is_bad_address((void *)a))
-			break;
+		if (is_bad_address((void *)a)) break;
 		*(volatile uint64_t *)a = 0;
 	}
 }
@@ -270,8 +301,7 @@ static void before_input_register(hook_fargs1_t *fargs, void *udata)
 		return;
 
 	bustype = *(volatile uint16_t *)(dev + OFF_ID_BUSTYPE);
-	if (bustype != BUS_USB_VAL)
-		return;
+	if (bustype != BUS_USB_VAL) return;
 
 	vendor  = *(volatile uint16_t *)(dev + OFF_ID_VENDOR);
 	product = *(volatile uint16_t *)(dev + OFF_ID_PRODUCT);
@@ -282,10 +312,9 @@ static void before_input_register(hook_fargs1_t *fargs, void *udata)
 			break;
 		}
 	}
-	if (matched < 0)
-		return;
+	if (matched < 0) return;
 
-    hit_count[matched]++;
+	hit_count[matched]++;
 
 	set_idx = matched % PRESET_SETS;
 	cls = classify(dev);
@@ -330,6 +359,7 @@ static void reset_config(void)
 {
 	int i;
 	target_count = 0;
+	drop_count = 0;
 	for (i = 0; i < MAX_TARGETS; i++) {
 		target_vid[i] = 0;
 		target_pid[i] = 0;
@@ -337,7 +367,6 @@ static void reset_config(void)
 		fake_phys[i][0] = 0;
 		hit_count[i] = 0;
 	}
-	drop_count = 0;
 }
 
 static void parse_args(const char *args)
@@ -349,7 +378,6 @@ static void parse_args(const char *args)
 	reset_config();
 
 	while (*p && idx < MAX_TARGETS) {
-
 		uint16_t vid = 0, pid = 0;
 		char name[64], phys[64];
 		name[0] = 0;
@@ -390,7 +418,6 @@ static void parse_args(const char *args)
 	target_count = idx;
 }
 
-/* ---- outMsg builders: Toast-friendly, bounded ---- */
 static int append_s(char *buf, int cap, int pos, const char *s)
 {
 	while (*s && pos < cap - 1) buf[pos++] = *s++;
@@ -456,7 +483,6 @@ static long hidhide_init(const char *args, const char *event, void *__user reser
 	(void)reserved;
 	reset_config();
 
-	/* KPM-Manager loads with empty args; fall through to compile-time default. */
 	if (args && args[0])
 		parse_args(args);
 	else
