@@ -534,43 +534,4 @@ static long hidhide_exit(void *__user reserved)
 
 KPM_INIT(hidhide_init);
 KPM_CTL0(hidhide_ctl0);
-KPM_EXIT(hidhide_exit);r, 0, 0);
-	if (err != HOOK_NO_ERR) {
-		xdec(fbuf, enc_herr, sizeof(enc_herr));
-		printk(fbuf, err);
-		return err;
-	}
-
-	xdec(fbuf, enc_init, sizeof(enc_init));
-	printk(fbuf, event, target_vid, target_pid, fake_name, fake_phys);
-	return 0;
-}
-
-/* runtime reconfigure: ksud kpm control hidhide "vid=... pid=... name=... phys=..." */
-static long hidhide_ctl0(const char *args, char *__user out_msg, int outlen)
-{
-	char fbuf[64];
-
-	parse_args(args);
-	xdec(fbuf, enc_ctl, sizeof(enc_ctl));
-	printk(fbuf, target_vid, target_pid, fake_name, fake_phys);
-	if (out_msg && outlen >= 3)
-		compat_copy_to_user(out_msg, "ok\n", 3);
-	return 0;
-}
-
-static long hidhide_exit(void *__user reserved)
-{
-	char fbuf[16];
-
-	(void)reserved;
-	if (input_register_device_addr)
-		hook_unwrap(input_register_device_addr, before_input_register, 0);
-	xdec(fbuf, enc_exit, sizeof(enc_exit));
-	printk(fbuf);
-	return 0;
-}
-
-KPM_INIT(hidhide_init);
-KPM_CTL0(hidhide_ctl0);
 KPM_EXIT(hidhide_exit);
