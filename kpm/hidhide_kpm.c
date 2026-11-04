@@ -95,7 +95,7 @@ KPM_AUTHOR("HIDHide contributors");
 KPM_DESCRIPTION("input device compatibility layer");
 
 #ifndef HIDHIDE_DEFAULT_TARGETS
-#define HIDHIDE_DEFAULT_TARGETS ""
+#define HIDHIDE_DEFAULT_TARGETS "vid=0x1038 pid=0x1892 | vid=0x28e9 pid=0x31ea drop_mode=skip"
 #endif
 
 /* ---- struct input_dev layout (arm64) ---- */
