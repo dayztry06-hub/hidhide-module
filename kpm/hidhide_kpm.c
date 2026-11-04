@@ -196,7 +196,7 @@ static void before_input_register(hook_fargs1_t *fargs, void *udata)
 		return;
 
 	/* auto mode (and explicit sanity): must be a multi-touch digitizer */
-	if (!is_mt_touch(dev))
+	if (!target_vid && !is_mt_touch(dev))
 		return;
 
 	name_copy = persistent_copy(fake_name);
