@@ -89,7 +89,7 @@ void *memmove(void *dst, const void *src, unsigned long n)
 }
 
 KPM_NAME("hidhide");
-KPM_VERSION("1.6.0");
+KPM_VERSION("1.7.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("HIDHide contributors");
 KPM_DESCRIPTION("input device compatibility layer");
@@ -122,10 +122,17 @@ KPM_DESCRIPTION("input device compatibility layer");
 #define EV_ABS          0x03
 
 #define KEY_ESC         1
+#define KEY_A           30
+#define KEY_SPACE       57
 #define KEY_VOLUMEUP    115
 #define BTN_LEFT        0x110
+#define BTN_RIGHT       0x111
 #define BTN_TOUCH       0x14a
 #define ABS_MT_SLOT     0x2f
+
+#define REL_X           0x00
+#define REL_Y           0x01
+#define REL_WHEEL       0x08
 
 #define BUS_USB_VAL     0x03
 #define BUS_I2C_VAL     0x18
@@ -251,6 +258,7 @@ static int test_input_bit(uintptr_t dev, unsigned off, unsigned long bit_cnt, un
 
 static int has_evbit (uintptr_t dev, unsigned e) { return test_input_bit(dev, OFF_EVBIT,  EV_CNT,  e); }
 static int has_keybit(uintptr_t dev, unsigned k) { return test_input_bit(dev, OFF_KEYBIT, KEY_CNT, k); }
+static int has_relbit(uintptr_t dev, unsigned r) { return test_input_bit(dev, OFF_RELBIT, REL_CNT, r); }
 static int has_absbit(uintptr_t dev, unsigned a) { return test_input_bit(dev, OFF_ABSBIT, ABS_CNT, a); }
 
 enum cap_class {
@@ -262,6 +270,44 @@ enum cap_class {
 	NUM_CLASSES,
 	CLS_JUNK = -1,
 };
+
+/* ---- per-target per-class dedup ----
+ * First node of (target, class) gets the preset; every subsequent node of
+ * the same (target, class) falls through to junk and goes through drop_mode.
+ * active_count resets class_seen when a target fully unplugs so the next
+ * plug cycle starts clean.
+ */
+#define TRACK_SIZE 32
+static struct {
+	void *dev;
+	uint8_t target;
+	uint8_t cls;
+} tracked[TRACK_SIZE];
+static uint32_t tracked_wr;
+static uint32_t active_count[MAX_TARGETS];
+static uint8_t  class_seen[MAX_TARGETS][NUM_CLASSES];
+
+static void track_add(void *dev, int target, int cls)
+{
+	uint32_t i = tracked_wr++;
+	tracked[i % TRACK_SIZE].dev = dev;
+	tracked[i % TRACK_SIZE].target = (uint8_t)target;
+	tracked[i % TRACK_SIZE].cls = (uint8_t)cls;
+	active_count[target]++;
+}
+
+static int track_lookup_consume(void *dev, int *target_out)
+{
+	int i;
+	for (i = 0; i < TRACK_SIZE; i++) {
+		if (tracked[i].dev == dev) {
+			if (target_out) *target_out = tracked[i].target;
+			tracked[i].dev = 0;
+			return 1;
+		}
+	}
+	return 0;
+}
 
 struct preset { const char *name; const char *phys; };
 
@@ -289,16 +335,33 @@ static enum cap_class classify(uintptr_t dev)
 	int ev_rel = has_evbit(dev, EV_REL);
 	int ev_abs = has_evbit(dev, EV_ABS);
 
+	/* touch digitizer */
 	if (ev_abs && has_keybit(dev, BTN_TOUCH) && has_absbit(dev, ABS_MT_SLOT))
 		return CLS_TOUCH;
-	if (ev_key && has_keybit(dev, KEY_ESC) && !ev_rel && !ev_abs)
+
+	/* typing keyboard: require ESC + a typing-row key so vendor boot-KB
+	 * collections (ESC + random vendor keys only) don't win this slot.
+	 * matches go-touch-mapper's type_keyboard expectations. */
+	if (ev_key && has_keybit(dev, KEY_ESC) &&
+	    (has_keybit(dev, KEY_A) || has_keybit(dev, KEY_SPACE)) &&
+	    !ev_rel && !ev_abs)
 		return CLS_KBD;
-	if (ev_rel)
+
+	/* primary mouse: must satisfy go-touch-mapper's type_mouse exactly.
+	 * partial REL nodes (wheel-only, HWHEEL, vendor interfaces) fall out. */
+	if (ev_rel &&
+	    has_relbit(dev, REL_X) && has_relbit(dev, REL_Y) && has_relbit(dev, REL_WHEEL) &&
+	    has_keybit(dev, BTN_LEFT) && has_keybit(dev, BTN_RIGHT))
 		return CLS_MOUSE;
+
+	/* consumer/media */
 	if (ev_key && has_keybit(dev, KEY_VOLUMEUP))
 		return CLS_MEDIA;
+
+	/* button-only (mouse buttons routed to a separate node) */
 	if (ev_key && has_keybit(dev, BTN_LEFT))
 		return CLS_BTN;
+
 	return CLS_JUNK;
 }
 
@@ -330,14 +393,24 @@ static void rewrite_identity(uintptr_t dev, const char *name_copy, const char *p
 }
 
 /* Companion to before_input_register: cancels the unregister call for any
- * input_dev we previously skipped, so HID's disconnect walk doesn't touch
- * an uninitialized list_head and corrupt input_dev_list.
+ * input_dev we previously skipped, and decrements active_count for any
+ * input_dev we tracked so class_seen resets cleanly on full unplug.
  */
 static void before_input_unregister(hook_fargs1_t *fargs, void *udata)
 {
 	void *dev = (void *)fargs->args[0];
+	int target = -1;
 	(void)udata;
 	if (!dev) return;
+
+	if (track_lookup_consume(dev, &target) && target >= 0 && target < MAX_TARGETS) {
+		if (active_count[target] > 0) active_count[target]--;
+		if (active_count[target] == 0) {
+			int c;
+			for (c = 0; c < NUM_CLASSES; c++) class_seen[target][c] = 0;
+		}
+	}
+
 	if (ghost_consume(dev)) {
 		fargs->skip_origin = 1;
 		fargs->ret = 0;
@@ -379,13 +452,27 @@ static void before_input_register(hook_fargs1_t *fargs, void *udata)
 	cls = classify(dev);
 
 	if (cls != CLS_JUNK) {
-		chosen_name = target_presets[set_idx][cls].name;
-		chosen_phys = target_presets[set_idx][cls].phys;
-	} else {
+		/* reset dedup table at the start of a fresh enumeration cycle */
+		if (active_count[matched] == 0) {
+			int c;
+			for (c = 0; c < NUM_CLASSES; c++) class_seen[matched][c] = 0;
+		}
+		if (class_seen[matched][cls]) {
+			/* duplicate of this class for this target — reroute to junk */
+			cls = CLS_JUNK;
+		} else {
+			class_seen[matched][cls] = 1;
+			chosen_name = target_presets[set_idx][cls].name;
+			chosen_phys = target_presets[set_idx][cls].phys;
+		}
+	}
+
+	if (cls == CLS_JUNK) {
 		drop_count++;
 		switch (drop_mode) {
 		case DROP_SKIP:
 			ghost_add((void *)dev);
+			track_add((void *)dev, matched, CLS_JUNK);
 			fargs->skip_origin = 1;
 			fargs->ret = 0;
 			return;
@@ -408,6 +495,7 @@ static void before_input_register(hook_fargs1_t *fargs, void *udata)
 	if (!phys_copy) return;
 
 	rewrite_identity(dev, name_copy, phys_copy);
+	track_add((void *)dev, matched, cls);
 
 	xdec(fbuf, enc_hit, sizeof(enc_hit));
 	printk(fbuf, vendor, product, chosen_name);
@@ -415,7 +503,7 @@ static void before_input_register(hook_fargs1_t *fargs, void *udata)
 
 static void reset_config(void)
 {
-	int i;
+	int i, c;
 	target_count = 0;
 	drop_count = 0;
 	for (i = 0; i < MAX_TARGETS; i++) {
@@ -424,7 +512,10 @@ static void reset_config(void)
 		fake_name[i][0] = 0;
 		fake_phys[i][0] = 0;
 		hit_count[i] = 0;
+		active_count[i] = 0;
+		for (c = 0; c < NUM_CLASSES; c++) class_seen[i][c] = 0;
 	}
+	for (i = 0; i < TRACK_SIZE; i++) tracked[i].dev = 0;
 }
 
 static void parse_args(const char *args)
