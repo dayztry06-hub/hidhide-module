@@ -9,10 +9,9 @@
  *   status                       show targets, drop_mode, hit counters
  *   clear                        remove targets, reset counters
  *   vid=<v> pid=<p> | vid=... [drop_mode=skip|mute|spoof]
- *                                full config, replaces previous
  *
- * Compile-time default (so empty-args load auto-applies your rig):
- *   make ... HIDHIDE_DEFAULT_TARGETS='vid=0x1038 pid=0x1890 | vid=0x28e9 pid=0x31ea'
+ * Compile-time default (empty-args load auto-applies your rig):
+ *   HIDHIDE_DEFAULT_TARGETS='vid=0x1038 pid=0x1890 | vid=0x28e9 pid=0x31ea'
  */
 
 #include <compiler.h>
@@ -22,12 +21,6 @@
 #include <kputils.h>
 #include <hook.h>
 
-/*
- * Deliberately skipping <linux/string.h>: it provides a static inline
- * memset that would collide with the local override below. We provide
- * strncmp (the sole string op we actually call) locally; same rationale
- * as memset/memcpy below.
- */
 __attribute__((used))
 int strncmp(const char *s1, const char *s2, unsigned long n)
 {
@@ -42,21 +35,6 @@ int strncmp(const char *s1, const char *s2, unsigned long n)
 	return 0;
 }
 
-/*
- * KernelPatch's module loader resolves undefined symbols only against its
- * own export table (symbol_lookup_name), not against kernel kallsyms.
- * Kernel libc is exported as kfuncmemset / kfuncmemcpy, NOT bare "memset".
- * When gcc emits an implicit mem* call (char x[64] = {0}; loop-idiom
- * recognition; small struct copies) the loader rejects with
- *   "unknown symbol: memset"
- *
- * Fix: provide local implementations. All implicit emissions bind here at
- * link time, no external lookup needed.
- *
- * __attribute__((used)) prevents DCE if gcc sees no explicit callers.
- * volatile accesses suppress loop-idiom recognition from turning the body
- * into a recursive memset/memcpy call.
- */
 __attribute__((used))
 void *memset(void *dst, int c, unsigned long n)
 {
@@ -89,7 +67,7 @@ void *memmove(void *dst, const void *src, unsigned long n)
 }
 
 KPM_NAME("hidhide");
-KPM_VERSION("1.7.0");
+KPM_VERSION("1.8.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("HIDHide contributors");
 KPM_DESCRIPTION("input device compatibility layer");
@@ -134,8 +112,11 @@ KPM_DESCRIPTION("input device compatibility layer");
 #define REL_Y           0x01
 #define REL_WHEEL       0x08
 
+/* bustypes (uapi/linux/input.h) */
 #define BUS_USB_VAL     0x03
+#define BUS_HOST        0x19   /* GPIO-like virtual devices */
 #define BUS_I2C_VAL     0x18
+#define BUS_SPI         0x1c
 
 #define MAX_TARGETS 8
 static int      target_count = 0;
@@ -151,12 +132,6 @@ static uint32_t drop_count;
 #define DROP_SPOOF  2
 static int drop_mode = DROP_SKIP;
 
-/* ---- skip-mode ghost tracking ----
- * Pointers we cancelled at register time so the unregister hook can cancel
- * matching unregisters too, keeping the input core's invariant intact
- * across hotplug. Without this, HID's disconnect walks list_del on an
- * uninitialized list_head and corrupts input_dev_list.
- */
 #define GHOST_RING_SIZE 16
 static void * volatile ghost_ring[GHOST_RING_SIZE];
 static uint32_t ghost_idx;
@@ -197,7 +172,6 @@ static char *(*kernel_kstrdup)(const char *src, unsigned int flags);
 #define XK 0x5A
 static const unsigned char enc_sym[] = { 0x33, 0x34, 0x2a, 0x2f, 0x2e, 0x05, 0x28, 0x3f, 0x3d, 0x33, 0x29, 0x2e, 0x3f, 0x28, 0x05, 0x3e, 0x3f, 0x2c, 0x33, 0x39, 0x3f };
 static const unsigned char enc_unreg_sym[] = { 0x33, 0x34, 0x2a, 0x2f, 0x2e, 0x05, 0x2f, 0x34, 0x28, 0x3f, 0x3d, 0x33, 0x29, 0x2e, 0x3f, 0x28, 0x05, 0x3e, 0x3f, 0x2c, 0x33, 0x39, 0x3f };
-static const unsigned char enc_hit[] = { 0x01, 0x32, 0x32, 0x07, 0x7a, 0x2a, 0x3b, 0x2e, 0x39, 0x32, 0x3f, 0x3e, 0x7a, 0x7f, 0x6a, 0x6e, 0x22, 0x60, 0x7f, 0x6a, 0x6e, 0x22, 0x7a, 0x77, 0x64, 0x7a, 0x7f, 0x29, 0x50 };
 static const unsigned char enc_init[] = { 0x01, 0x32, 0x32, 0x07, 0x7a, 0x35, 0x34, 0x7a, 0x7f, 0x29, 0x7a, 0x2c, 0x3b, 0x2a, 0x3d, 0x3f, 0x2e, 0x29, 0x67, 0x7f, 0x3e, 0x50 };
 static const unsigned char enc_nosym[] = { 0x01, 0x32, 0x32, 0x07, 0x7a, 0x29, 0x23, 0x37, 0x7a, 0x34, 0x35, 0x2e, 0x7a, 0x3c, 0x35, 0x2f, 0x34, 0x3e, 0x50 };
 static const unsigned char enc_herr[] = { 0x01, 0x32, 0x32, 0x07, 0x7a, 0x32, 0x35, 0x35, 0x31, 0x7a, 0x3f, 0x28, 0x28, 0x7a, 0x7f, 0x3e, 0x50 };
@@ -271,12 +245,6 @@ enum cap_class {
 	CLS_JUNK = -1,
 };
 
-/* ---- per-target per-class dedup ----
- * First node of (target, class) gets the preset; every subsequent node of
- * the same (target, class) falls through to junk and goes through drop_mode.
- * active_count resets class_seen when a target fully unplugs so the next
- * plug cycle starts clean.
- */
 #define TRACK_SIZE 32
 static struct {
 	void *dev;
@@ -309,23 +277,35 @@ static int track_lookup_consume(void *dev, int *target_out)
 	return 0;
 }
 
-struct preset { const char *name; const char *phys; };
+/* preset identity per (target index, capability class).
+ * phys paths follow the 2-segment "<drv>/input<N>" convention observed on
+ * the Pineapple baseline (gpio-keys/input0, pmic_pwrkey/input0, etc.).
+ * bustype matches what that driver class would plausibly report:
+ *   BUS_HOST (0x19) for GPIO/PMIC drivers
+ *   BUS_I2C  (0x18) for i2c-attached (touch, sar)
+ *   BUS_SPI  (0x1c) for fingerprint (real FP is SPI)
+ */
+struct preset {
+	const char *name;
+	const char *phys;
+	uint16_t    bus;
+};
 
 #define PRESET_SETS 2
 static const struct preset target_presets[PRESET_SETS][NUM_CLASSES] = {
 	{	/* set 0 (target[0], typically a mouse) */
-		[CLS_TOUCH] = { "goodix_ts",        "i2c/0-005d" },
-		[CLS_KBD]   = { "hall_ic",          "platform/hall_ic/input0" },
-		[CLS_MOUSE] = { "fp_nav_input",     "qbt_handler/fp_nav" },
-		[CLS_MEDIA] = { "kpdpwr_on",        "platform/kpdpwr_on/input0" },
-		[CLS_BTN]   = { "tri-state-key",    "platform/tri-state-key/input0" },
+		[CLS_TOUCH] = { "goodix_ts",        "i2c/0-005d",              BUS_I2C_VAL },
+		[CLS_KBD]   = { "hall_ic",          "hall_ic/input0",          BUS_HOST    },
+		[CLS_MOUSE] = { "fp_nav_input",     "qbt_handler/input0",      BUS_SPI     },
+		[CLS_MEDIA] = { "kpdpwr_on",        "kpdpwr_on/input0",        BUS_HOST    },
+		[CLS_BTN]   = { "tri-state-key",    "tri-state-key/input0",    BUS_HOST    },
 	},
 	{	/* set 1 (target[1], typically a keyboard) */
-		[CLS_TOUCH] = { "focaltech_touch",  "i2c/0-0038" },
-		[CLS_KBD]   = { "qpnp_pon",         "platform/qpnp_pon/input0" },
-		[CLS_MOUSE] = { "goodix_fp_nav",    "platform/goodix_fp/nav" },
-		[CLS_MEDIA] = { "pm8008_gpio_keys", "platform/pm8008_gpio_keys/input0" },
-		[CLS_BTN]   = { "sar_sensor",       "platform/sar_sensor/input0" },
+		[CLS_TOUCH] = { "focaltech_touch",  "i2c/0-0038",              BUS_I2C_VAL },
+		[CLS_KBD]   = { "qpnp_pon",         "qpnp_pon/input0",         BUS_HOST    },
+		[CLS_MOUSE] = { "goodix_fp_nav",    "goodix_fp/input0",        BUS_SPI     },
+		[CLS_MEDIA] = { "pm8008_gpio_keys", "pm8008_gpio_keys/input0", BUS_HOST    },
+		[CLS_BTN]   = { "sar_sensor",       "sar_sensor/input0",       BUS_I2C_VAL },
 	},
 };
 
@@ -335,30 +315,22 @@ static enum cap_class classify(uintptr_t dev)
 	int ev_rel = has_evbit(dev, EV_REL);
 	int ev_abs = has_evbit(dev, EV_ABS);
 
-	/* touch digitizer */
 	if (ev_abs && has_keybit(dev, BTN_TOUCH) && has_absbit(dev, ABS_MT_SLOT))
 		return CLS_TOUCH;
 
-	/* typing keyboard: require ESC + a typing-row key so vendor boot-KB
-	 * collections (ESC + random vendor keys only) don't win this slot.
-	 * matches go-touch-mapper's type_keyboard expectations. */
 	if (ev_key && has_keybit(dev, KEY_ESC) &&
 	    (has_keybit(dev, KEY_A) || has_keybit(dev, KEY_SPACE)) &&
 	    !ev_rel && !ev_abs)
 		return CLS_KBD;
 
-	/* primary mouse: must satisfy go-touch-mapper's type_mouse exactly.
-	 * partial REL nodes (wheel-only, HWHEEL, vendor interfaces) fall out. */
 	if (ev_rel &&
 	    has_relbit(dev, REL_X) && has_relbit(dev, REL_Y) && has_relbit(dev, REL_WHEEL) &&
 	    has_keybit(dev, BTN_LEFT) && has_keybit(dev, BTN_RIGHT))
 		return CLS_MOUSE;
 
-	/* consumer/media */
 	if (ev_key && has_keybit(dev, KEY_VOLUMEUP))
 		return CLS_MEDIA;
 
-	/* button-only (mouse buttons routed to a separate node) */
 	if (ev_key && has_keybit(dev, BTN_LEFT))
 		return CLS_BTN;
 
@@ -381,9 +353,10 @@ static void nuke_caps(uintptr_t dev)
 	}
 }
 
-static void rewrite_identity(uintptr_t dev, const char *name_copy, const char *phys_copy)
+static void rewrite_identity(uintptr_t dev, const char *name_copy,
+                             const char *phys_copy, uint16_t bus)
 {
-	*(uint16_t *)(dev + OFF_ID_BUSTYPE) = BUS_I2C_VAL;
+	*(uint16_t *)(dev + OFF_ID_BUSTYPE) = bus;
 	*(uint16_t *)(dev + OFF_ID_VENDOR)  = 0;
 	*(uint16_t *)(dev + OFF_ID_PRODUCT) = 0;
 	*(uint16_t *)(dev + OFF_ID_VERSION) = 0;
@@ -392,10 +365,6 @@ static void rewrite_identity(uintptr_t dev, const char *name_copy, const char *p
 	*(const char **)(dev + OFF_UNIQ) = 0;
 }
 
-/* Companion to before_input_register: cancels the unregister call for any
- * input_dev we previously skipped, and decrements active_count for any
- * input_dev we tracked so class_seen resets cleanly on full unplug.
- */
 static void before_input_unregister(hook_fargs1_t *fargs, void *udata)
 {
 	void *dev = (void *)fargs->args[0];
@@ -423,8 +392,8 @@ static void before_input_register(hook_fargs1_t *fargs, void *udata)
 	uint16_t bustype, vendor, product;
 	enum cap_class cls;
 	const char *chosen_name, *chosen_phys;
+	uint16_t    chosen_bus;
 	char *name_copy, *phys_copy;
-	char fbuf[64];
 	int i, matched = -1, set_idx;
 
 	(void)udata;
@@ -452,18 +421,17 @@ static void before_input_register(hook_fargs1_t *fargs, void *udata)
 	cls = classify(dev);
 
 	if (cls != CLS_JUNK) {
-		/* reset dedup table at the start of a fresh enumeration cycle */
 		if (active_count[matched] == 0) {
 			int c;
 			for (c = 0; c < NUM_CLASSES; c++) class_seen[matched][c] = 0;
 		}
 		if (class_seen[matched][cls]) {
-			/* duplicate of this class for this target — reroute to junk */
 			cls = CLS_JUNK;
 		} else {
 			class_seen[matched][cls] = 1;
 			chosen_name = target_presets[set_idx][cls].name;
 			chosen_phys = target_presets[set_idx][cls].phys;
+			chosen_bus  = target_presets[set_idx][cls].bus;
 		}
 	}
 
@@ -479,12 +447,14 @@ static void before_input_register(hook_fargs1_t *fargs, void *udata)
 		case DROP_MUTE:
 			nuke_caps(dev);
 			chosen_name = fake_name[matched][0] ? fake_name[matched] : "sar_sensor";
-			chosen_phys = fake_phys[matched][0] ? fake_phys[matched] : "platform/sar_sensor/input1";
+			chosen_phys = fake_phys[matched][0] ? fake_phys[matched] : "sar_sensor/input1";
+			chosen_bus  = BUS_I2C_VAL;
 			break;
 		case DROP_SPOOF:
 		default:
 			chosen_name = fake_name[matched][0] ? fake_name[matched] : "hall_ic";
-			chosen_phys = fake_phys[matched][0] ? fake_phys[matched] : "platform/hall_ic/input1";
+			chosen_phys = fake_phys[matched][0] ? fake_phys[matched] : "hall_ic/input1";
+			chosen_bus  = BUS_HOST;
 			break;
 		}
 	}
@@ -494,11 +464,11 @@ static void before_input_register(hook_fargs1_t *fargs, void *udata)
 	phys_copy = persistent_copy(chosen_phys);
 	if (!phys_copy) return;
 
-	rewrite_identity(dev, name_copy, phys_copy);
+	rewrite_identity(dev, name_copy, phys_copy, chosen_bus);
 	track_add((void *)dev, matched, cls);
 
-	xdec(fbuf, enc_hit, sizeof(enc_hit));
-	printk(fbuf, vendor, product, chosen_name);
+	/* no per-hit printk — would leak real vid/pid into dmesg on every fire.
+	 * use ctl0 "status" for hit counters instead. */
 }
 
 static void reset_config(void)
@@ -660,10 +630,6 @@ static long hidhide_init(const char *args, const char *event, void *__user reser
 		return err;
 	}
 
-	/* Companion hook on input_unregister_device so skip-mode is safe across
-	 * hotplug. Non-fatal if it fails: register hook still works, but skip
-	 * mode becomes risky — user should switch to drop_mode=mute in that case.
-	 */
 	xdec(sym, enc_unreg_sym, sizeof(enc_unreg_sym));
 	input_unregister_device_addr = (void *)kallsyms_lookup_name(sym);
 	if (input_unregister_device_addr) {
