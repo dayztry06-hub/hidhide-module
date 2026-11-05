@@ -12,7 +12,7 @@
  *                                full config, replaces previous
  *
  * Compile-time default (so empty-args load auto-applies your rig):
- *   make ... HIDHIDE_DEFAULT_TARGETS='vid=0x1038 pid=0x1892 | vid=0x28e9 pid=0x31ea'
+ *   make ... HIDHIDE_DEFAULT_TARGETS='vid=0x1038 pid=0x1890 | vid=0x28e9 pid=0x31ea'
  */
 
 #include <compiler.h>
@@ -24,9 +24,9 @@
 
 /*
  * Deliberately skipping <linux/string.h>: it provides a static inline
- * memset that would collide with the local override below. We declare
- * only strncmp (the sole string op we actually call); gcc inlines
- * constant-length strncmp calls, so no external symbol reference is emitted.
+ * memset that would collide with the local override below. We provide
+ * strncmp (the sole string op we actually call) locally; same rationale
+ * as memset/memcpy below.
  */
 __attribute__((used))
 int strncmp(const char *s1, const char *s2, unsigned long n)
@@ -89,13 +89,13 @@ void *memmove(void *dst, const void *src, unsigned long n)
 }
 
 KPM_NAME("hidhide");
-KPM_VERSION("1.5.0");
+KPM_VERSION("1.6.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("HIDHide contributors");
 KPM_DESCRIPTION("input device compatibility layer");
 
 #ifndef HIDHIDE_DEFAULT_TARGETS
-#define HIDHIDE_DEFAULT_TARGETS "vid=0x1038 pid=0x1892 | vid=0x28e9 pid=0x31ea drop_mode=skip"
+#define HIDHIDE_DEFAULT_TARGETS "vid=0x1038 pid=0x1890 | vid=0x28e9 pid=0x31ea drop_mode=skip"
 #endif
 
 /* ---- struct input_dev layout (arm64) ---- */
@@ -144,6 +144,37 @@ static uint32_t drop_count;
 #define DROP_SPOOF  2
 static int drop_mode = DROP_SKIP;
 
+/* ---- skip-mode ghost tracking ----
+ * Pointers we cancelled at register time so the unregister hook can cancel
+ * matching unregisters too, keeping the input core's invariant intact
+ * across hotplug. Without this, HID's disconnect walks list_del on an
+ * uninitialized list_head and corrupts input_dev_list.
+ */
+#define GHOST_RING_SIZE 16
+static void * volatile ghost_ring[GHOST_RING_SIZE];
+static uint32_t ghost_idx;
+
+static void ghost_add(void *dev)
+{
+	uint32_t i = ghost_idx++;
+	ghost_ring[i % GHOST_RING_SIZE] = dev;
+}
+
+static int ghost_consume(void *dev)
+{
+	int i;
+	for (i = 0; i < GHOST_RING_SIZE; i++) {
+		if (ghost_ring[i] == dev) {
+			ghost_ring[i] = 0;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static void *input_register_device_addr = 0;
+static void *input_unregister_device_addr = 0;
+
 static const char *drop_mode_name(int m)
 {
 	switch (m) {
@@ -158,6 +189,7 @@ static char *(*kernel_kstrdup)(const char *src, unsigned int flags);
 
 #define XK 0x5A
 static const unsigned char enc_sym[] = { 0x33, 0x34, 0x2a, 0x2f, 0x2e, 0x05, 0x28, 0x3f, 0x3d, 0x33, 0x29, 0x2e, 0x3f, 0x28, 0x05, 0x3e, 0x3f, 0x2c, 0x33, 0x39, 0x3f };
+static const unsigned char enc_unreg_sym[] = { 0x33, 0x34, 0x2a, 0x2f, 0x2e, 0x05, 0x2f, 0x34, 0x28, 0x3f, 0x3d, 0x33, 0x29, 0x2e, 0x3f, 0x28, 0x05, 0x3e, 0x3f, 0x2c, 0x33, 0x39, 0x3f };
 static const unsigned char enc_hit[] = { 0x01, 0x32, 0x32, 0x07, 0x7a, 0x2a, 0x3b, 0x2e, 0x39, 0x32, 0x3f, 0x3e, 0x7a, 0x7f, 0x6a, 0x6e, 0x22, 0x60, 0x7f, 0x6a, 0x6e, 0x22, 0x7a, 0x77, 0x64, 0x7a, 0x7f, 0x29, 0x50 };
 static const unsigned char enc_init[] = { 0x01, 0x32, 0x32, 0x07, 0x7a, 0x35, 0x34, 0x7a, 0x7f, 0x29, 0x7a, 0x2c, 0x3b, 0x2a, 0x3d, 0x3f, 0x2e, 0x29, 0x67, 0x7f, 0x3e, 0x50 };
 static const unsigned char enc_nosym[] = { 0x01, 0x32, 0x32, 0x07, 0x7a, 0x29, 0x23, 0x37, 0x7a, 0x34, 0x35, 0x2e, 0x7a, 0x3c, 0x35, 0x2f, 0x34, 0x3e, 0x50 };
@@ -297,6 +329,21 @@ static void rewrite_identity(uintptr_t dev, const char *name_copy, const char *p
 	*(const char **)(dev + OFF_UNIQ) = 0;
 }
 
+/* Companion to before_input_register: cancels the unregister call for any
+ * input_dev we previously skipped, so HID's disconnect walk doesn't touch
+ * an uninitialized list_head and corrupt input_dev_list.
+ */
+static void before_input_unregister(hook_fargs1_t *fargs, void *udata)
+{
+	void *dev = (void *)fargs->args[0];
+	(void)udata;
+	if (!dev) return;
+	if (ghost_consume(dev)) {
+		fargs->skip_origin = 1;
+		fargs->ret = 0;
+	}
+}
+
 static void before_input_register(hook_fargs1_t *fargs, void *udata)
 {
 	uintptr_t dev = (uintptr_t)fargs->args[0];
@@ -338,6 +385,7 @@ static void before_input_register(hook_fargs1_t *fargs, void *udata)
 		drop_count++;
 		switch (drop_mode) {
 		case DROP_SKIP:
+			ghost_add((void *)dev);
 			fargs->skip_origin = 1;
 			fargs->ret = 0;
 			return;
@@ -364,8 +412,6 @@ static void before_input_register(hook_fargs1_t *fargs, void *udata)
 	xdec(fbuf, enc_hit, sizeof(enc_hit));
 	printk(fbuf, vendor, product, chosen_name);
 }
-
-static void *input_register_device_addr = 0;
 
 static void reset_config(void)
 {
@@ -523,6 +569,18 @@ static long hidhide_init(const char *args, const char *event, void *__user reser
 		return err;
 	}
 
+	/* Companion hook on input_unregister_device so skip-mode is safe across
+	 * hotplug. Non-fatal if it fails: register hook still works, but skip
+	 * mode becomes risky — user should switch to drop_mode=mute in that case.
+	 */
+	xdec(sym, enc_unreg_sym, sizeof(enc_unreg_sym));
+	input_unregister_device_addr = (void *)kallsyms_lookup_name(sym);
+	if (input_unregister_device_addr) {
+		hook_err_t err2 = hook_wrap1(input_unregister_device_addr,
+		                             before_input_unregister, 0, 0);
+		if (err2 != HOOK_NO_ERR) input_unregister_device_addr = 0;
+	}
+
 	xdec(fbuf, enc_init, sizeof(enc_init));
 	printk(fbuf, event, target_count);
 	return 0;
@@ -568,6 +626,8 @@ static long hidhide_exit(void *__user reserved)
 	(void)reserved;
 	if (input_register_device_addr)
 		hook_unwrap(input_register_device_addr, before_input_register, 0);
+	if (input_unregister_device_addr)
+		hook_unwrap(input_unregister_device_addr, before_input_unregister, 0);
 	xdec(fbuf, enc_exit, sizeof(enc_exit));
 	printk(fbuf);
 	return 0;
